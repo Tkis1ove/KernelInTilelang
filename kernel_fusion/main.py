@@ -1,5 +1,5 @@
 import torch
-from torch import Tensor
+from torch import Tensor, autocast
 from torch.utils.benchmark import Timer
 from torch.utils.cpp_extension import load
 
@@ -27,27 +27,27 @@ def fusion_baseline(q: Tensor, k: Tensor, v: Tensor, rel1: Tensor, rel2: Tensor,
     '''
     scale = q.size(-1) ** (-0.5)
 
-    sim1 = torch.einsum('b i d, b j d -> b i j', q, k) * scale
-    sim2 = torch.einsum('b i d, i j d -> b i j', q, rel1) * scale
-
-    s = torch.softmax(sim1 + sim2, dim=-1).to(q.dtype) + mask
-
-    out1 = torch.matmul(s, v)
-    out2 = torch.einsum('b i j, i j d -> b i d', s, rel2)
+    sim1 = (torch.einsum('b i d, b j d -> b i j', q, k) * scale).to(q.dtype)
+    # sim2 = torch.einsum('b i d, i j d -> b i j', q, rel1) * scale
+# 
+    # s = torch.softmax(sim1 + sim2, dim=-1).to(q.dtype) + mask
+# 
+    # out1 = torch.matmul(s, v)
+    # out2 = torch.einsum('b i j, i j d -> b i d', s, rel2)
 
     return sim1 # out1 + out2
 
 if __name__ == "__main__":
     b, l_q, l_kv, d = 6400, 16, 16, 64
 
-    q = torch.randn(b, l_q, d, device='cuda')
-    k = torch.randn(b, l_kv, d, device='cuda')
-    v = torch.randn(b, l_kv, d, device='cuda')
-    rel1 = torch.randn(l_q, l_kv, d, device='cuda')
-    rel2 = torch.randn(l_q, l_kv, d, device='cuda')
+    q = torch.randn(b, l_q, d, device='cuda', dtype=torch.float16)
+    k = torch.randn(b, l_kv, d, device='cuda', dtype=torch.float16)
+    v = torch.randn(b, l_kv, d, device='cuda', dtype=torch.float16)
+    rel1 = torch.randn(l_q, l_kv, d, device='cuda', dtype=torch.float16)
+    rel2 = torch.randn(l_q, l_kv, d, device='cuda', dtype=torch.float16)
 
     p = 0.1
-    mask = torch.zeros(b, l_q, l_kv, device=q.device, dtype=q.dtype)
+    mask = torch.zeros(b, l_q, l_kv, device=q.device, dtype=torch.float16)
     mask.masked_fill_(torch.rand(b, l_q, l_kv, device=q.device) < p, float('-inf'))
 
     # 正确性检验
@@ -76,7 +76,7 @@ if __name__ == "__main__":
         stmt='fusion_baseline(q, k, v, rel1, rel2, mask)',
         globals=globals_dict,
     ).blocked_autorange(min_run_time=1.0)
-
+    
     t_custom = Timer(
         stmt='fusion_kernel.fusion(q, k, v, rel1, rel2, mask)',
         globals=globals_dict,
