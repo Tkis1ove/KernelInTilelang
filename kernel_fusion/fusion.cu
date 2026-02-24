@@ -1,6 +1,8 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <torch/extension.h>
+#include <cstdint>
+#include "ptx.cuh"
 
 /*
 q           :[b, l_q, d]
@@ -16,9 +18,16 @@ out1 = s @ v     :[b, l_q, d]
 out2 = s @ rel2  :[b, l_q, d]
 
 o = out1 + out2  :[b, l_q, d]
+
+l_q = l_kv = 16
+d = 64
 */
 
-#define BLOCK_SIZE 128
+#define BLOCK_SIZE 32
+#define WARP_SIZE 32
+#define MMA_M 16
+#define MMA_N 8
+#define MMA_K 16
 
 __global__ void fusion_kernel(const half* q, const half* k, 
                               const half* v, half* o,
@@ -27,35 +36,75 @@ __global__ void fusion_kernel(const half* q, const half* k,
                               int b, int l_q, int l_kv, int d) {
     int bid = blockIdx.x;
     int tid = threadIdx.x;
+    int lane_id = threadIdx.x % WARP_SIZE;
 
     float scale = rsqrtf((float)d);
 
-    __shared__ half shared_q[1024];
-    __shared__ half shared_k[1024];
-    __shared__ half shared_sim1[256];
+    constexpr int N_M = 1;   // 16 / MMA_M
+    constexpr int N_N = 2;   // 16 / MMA_N
+    constexpr int N_K = 4;   // 64 / MMA_K
+
+    __shared__ half shared_q[16 * 64];
+    __shared__ half shared_k[16 * 64];
+
+    uint32_t reg_q[N_M][N_K][4];
+    uint32_t reg_k[N_N][N_K][2];
+    float reg_sim1[N_M][N_N][4] = {};
     
-    for (int i = tid; i < 1024; i += BLOCK_SIZE) {
+    // global to shared
+    for (int i = tid; i < l_q * d; i += BLOCK_SIZE) {
         shared_q[i] = q[bid * l_q * d + i];
     }
 
-    for (int i = tid; i < 1024; i += BLOCK_SIZE) {
+    for (int i = tid; i < l_kv * d; i += BLOCK_SIZE) {
         shared_k[i] = k[bid * l_kv * d + i];
     }
 
     __syncthreads();
 
-    for (int i = tid; i < l_q * l_kv; i += BLOCK_SIZE) {
-        int row = i / l_kv;
-        int col = i % l_kv;
-        float sum = 0.0f;
-        for (int j = 0; j < d; ++j) {
-            sum += __half2float(shared_q[row * d + j]) * __half2float(shared_k[col * d + j]);
+    // shared to register
+    for (int i = 0; i < l_q / MMA_M; ++i) {
+        for (int j = 0; j < d / MMA_K; ++j) {
+            int row = lane_id % 16 + i * MMA_M;
+            int col = lane_id / 16 * 8 + MMA_K * j;
+            uint32_t addr = __cvta_generic_to_shared(&shared_q[row * d + col]);
+            ldmatrix_x4(reg_q[i][j], addr);
         }
-        shared_sim1[i] = __float2half(sum * scale);
     }
 
-    for (int i = tid; i < 256; i += BLOCK_SIZE) {
-        o[bid * l_q * l_kv + i] = shared_sim1[i];
+    for (int i = 0; i < l_kv / MMA_N; ++i) {
+        for (int j = 0; j < d / MMA_K; ++j) {
+            int row = lane_id % 8 + i * MMA_N;
+            int col = lane_id / 8 * 8 + j * MMA_K;
+            uint32_t addr = __cvta_generic_to_shared(&shared_k[row * d + col]);
+            ldmatrix_x2(reg_k[i][j], addr);
+        }
+    }
+
+    __syncthreads();
+
+    for (int i = 0; i < l_q / MMA_M; ++i) {
+        for (int j = 0; j < l_kv / MMA_N; ++j) {
+            for (int k = 0; k < d / MMA_K; ++k) {
+                mma_m16n8k16(reg_q[i][k],
+                             reg_k[j][k],
+                             reg_sim1[i][j]);
+            }
+        }
+    }
+
+    for (int i = 0; i < l_q / MMA_M; ++i) {
+        for (int j = 0; j < l_kv / MMA_N; ++j) {
+            int offset = bid * l_q * l_kv;
+            int row0 = lane_id >> 2;
+            int row1 = row0 + 8;
+            int col0 = lane_id % 4 * 2 + j * MMA_N;
+            int col1 = col0 + 1;
+            o[offset + row0 * l_kv + col0] = __float2half(reg_sim1[i][j][0] * scale);
+            o[offset + row0 * l_kv + col1] = __float2half(reg_sim1[i][j][1] * scale);
+            o[offset + row1 * l_kv + col0] = __float2half(reg_sim1[i][j][2] * scale);
+            o[offset + row1 * l_kv + col1] = __float2half(reg_sim1[i][j][3] * scale);
+        }
     }
 }
 
@@ -68,7 +117,7 @@ torch::Tensor fusion(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::T
     auto o = torch::zeros({b, l_q, l_kv}, q.options());
 
     dim3 grid = {(unsigned int)b};
-    dim3 block = {128};
+    dim3 block = {BLOCK_SIZE};
 
     fusion_kernel<<<grid, block>>>(
         reinterpret_cast<const half*>(q.data_ptr<at::Half>()),

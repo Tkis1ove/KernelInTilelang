@@ -38,7 +38,7 @@ def fusion_baseline(q: Tensor, k: Tensor, v: Tensor, rel1: Tensor, rel2: Tensor,
     return sim1 # out1 + out2
 
 if __name__ == "__main__":
-    b, l_q, l_kv, d = 6400, 16, 16, 64
+    b, l_q, l_kv, d = 20480, 16, 16, 64
 
     q = torch.randn(b, l_q, d, device='cuda', dtype=torch.float16)
     k = torch.randn(b, l_kv, d, device='cuda', dtype=torch.float16)
