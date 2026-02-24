@@ -27,3 +27,22 @@ void ldmatrix_x2(uint32_t regs[2], uint32_t addr) {
                  : "=r"(regs[0]), "=r"(regs[1])
                  : "r"(addr));
 }
+
+template <int HEIGHT, int WIDTH, int TB_SIZE>
+__device__ inline
+void g2s(half* dst, const half* src, int src_stride, int tid) {
+    constexpr int num_elems = 16 / sizeof(half);
+    constexpr int num_iters = (HEIGHT * WIDTH) / (num_elems * TB_SIZE);
+
+    for (int i = 0; i < num_iters; i++) {
+        const int idx = (i * TB_SIZE + tid) * num_elems;
+        const int row = idx / WIDTH;
+        const int col = idx % WIDTH;
+
+        const uint32_t dst_addr = __cvta_generic_to_shared(&dst[idx]);
+        const half* src_addr = src + (row * src_stride + col);
+        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;"
+                     : : "r"(dst_addr), "l"(src_addr));
+    }
+    asm volatile("cp.async.commit_group;");
+}

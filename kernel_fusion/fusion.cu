@@ -33,7 +33,7 @@ __global__ void fusion_kernel(const half* q, const half* k,
                               const half* v, half* o,
                               const half* rel1, const half* rel2, 
                               const half* mask,
-                              int b, int l_q, int l_kv, int d) {
+                              const int b, const int l_q, const int l_kv, const int d) {
     int bid = blockIdx.x;
     int tid = threadIdx.x;
     int lane_id = threadIdx.x % WARP_SIZE;
@@ -52,13 +52,17 @@ __global__ void fusion_kernel(const half* q, const half* k,
     float reg_sim1[N_M][N_N][4] = {};
     
     // global to shared
-    for (int i = tid; i < l_q * d; i += BLOCK_SIZE) {
-        shared_q[i] = q[bid * l_q * d + i];
-    }
+    // for (int i = tid; i < l_q * d; i += BLOCK_SIZE) {
+    //     shared_q[i] = q[bid * l_q * d + i];
+    // }
 
-    for (int i = tid; i < l_kv * d; i += BLOCK_SIZE) {
-        shared_k[i] = k[bid * l_kv * d + i];
-    }
+    g2s<16, 64, BLOCK_SIZE>(shared_q, q + bid * l_q * d, d, tid);
+
+    // for (int i = tid; i < l_kv * d; i += BLOCK_SIZE) {
+    //     shared_k[i] = k[bid * l_kv * d + i];
+    // }
+    g2s<16, 64, BLOCK_SIZE>(shared_k, k + bid * l_kv * d, d, tid);
+    asm volatile("cp.async.wait_all;");
 
     __syncthreads();
 
@@ -109,10 +113,10 @@ __global__ void fusion_kernel(const half* q, const half* k,
 }
 
 torch::Tensor fusion(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor rel1, torch::Tensor rel2, torch::Tensor mask) {
-    int b = q.size(0);
-    int l_q = q.size(1);
-    int l_kv = k.size(1);
-    int d = q.size(2);
+    const int b = q.size(0);
+    const int l_q = q.size(1);
+    const int l_kv = k.size(1);
+    const int d = q.size(2);
 
     auto o = torch::zeros({b, l_q, l_kv}, q.options());
 
