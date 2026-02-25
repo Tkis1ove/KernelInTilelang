@@ -2,6 +2,13 @@
 #include <cuda_fp16.h>
 
 __device__ inline
+uint32_t swizzle(int row, int col) {
+    int new_row = row % 8;
+    int new_col = (col >> 3) ^ new_row;
+    return new_col << 3;
+}
+
+__device__ inline
 void mma_m16n8k16(uint32_t A[4], uint32_t B[2], float D[4]) {
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
                  "{%0, %1, %2, %3}, "
@@ -39,7 +46,7 @@ void g2s(half* dst, const half* src, int src_stride, int tid) {
         const int row = idx / WIDTH;
         const int col = idx % WIDTH;
 
-        const uint32_t dst_addr = __cvta_generic_to_shared(&dst[idx]);
+        const uint32_t dst_addr = __cvta_generic_to_shared(&dst[row * WIDTH + swizzle(row, col)]);
         const half* src_addr = src + (row * src_stride + col);
         asm volatile("cp.async.cg.shared.global [%0], [%1], 16;"
                      : : "r"(dst_addr), "l"(src_addr));

@@ -52,15 +52,7 @@ __global__ void fusion_kernel(const half* q, const half* k,
     float reg_sim1[N_M][N_N][4] = {};
     
     // global to shared
-    // for (int i = tid; i < l_q * d; i += BLOCK_SIZE) {
-    //     shared_q[i] = q[bid * l_q * d + i];
-    // }
-
     g2s<16, 64, BLOCK_SIZE>(shared_q, q + bid * l_q * d, d, tid);
-
-    // for (int i = tid; i < l_kv * d; i += BLOCK_SIZE) {
-    //     shared_k[i] = k[bid * l_kv * d + i];
-    // }
     g2s<16, 64, BLOCK_SIZE>(shared_k, k + bid * l_kv * d, d, tid);
     asm volatile("cp.async.wait_all;");
 
@@ -71,7 +63,7 @@ __global__ void fusion_kernel(const half* q, const half* k,
         for (int j = 0; j < d / MMA_K; ++j) {
             int row = lane_id % 16 + i * MMA_M;
             int col = lane_id / 16 * 8 + MMA_K * j;
-            uint32_t addr = __cvta_generic_to_shared(&shared_q[row * d + col]);
+            uint32_t addr = __cvta_generic_to_shared(&shared_q[row * d + swizzle(row, col)]);
             ldmatrix_x4(reg_q[i][j], addr);
         }
     }
@@ -80,7 +72,7 @@ __global__ void fusion_kernel(const half* q, const half* k,
         for (int j = 0; j < d / MMA_K; ++j) {
             int row = lane_id % 8 + i * MMA_N;
             int col = lane_id / 8 * 8 + j * MMA_K;
-            uint32_t addr = __cvta_generic_to_shared(&shared_k[row * d + col]);
+            uint32_t addr = __cvta_generic_to_shared(&shared_k[row * d + swizzle(row, col)]);
             ldmatrix_x2(reg_k[i][j], addr);
         }
     }
